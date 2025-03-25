@@ -1,0 +1,24 @@
+Ielādes datums: 2025-03-18 17:52:50
+Statuss: KĻŪDA
+Faila nosaukums: 0460_SIB240821_8710816_20250318152854.xml
+KĻŪDAS APRAKSTS/PIEZĪMES: No embedded document found in XML
+==================================================
+
+Ielādes datums: 2025-03-18 17:54:07
+Statuss: KĻŪDA
+Faila nosaukums: testtest.xml
+KĻŪDAS APRAKSTS/PIEZĪMES: Failed to decode Base64 data: Invalid base64-encoded string: number of data characters (207349) cannot be 1 more than a multiple of 4
+==================================================
+
+Ielādes datums: 2025-03-18 17:54:07
+Statuss: KĻŪDA
+Faila nosaukums: 0460_SIB240821_8710816_20250318152854.xml
+KĻŪDAS APRAKSTS/PIEZĪMES: No embedded document found in XML
+==================================================
+
+Ielādes datums: 2025-03-21 02:58:14
+Statuss: KĻŪDA
+Faila nosaukums: 0460_SIB240821_8710816_20250318152854.xml
+KĻŪDAS APRAKSTS/PIEZĪMES: No embedded document found in XML
+==================================================
+
