@@ -68,6 +68,9 @@ class ConfigManager:
     
     def set(self, key: str, value):
         """Set configuration value and save to file"""
+        # Convert directory paths to absolute paths
+        if key.endswith('_directory') and value:
+            value = os.path.abspath(value)
         self.config[key] = value
         return self.save_config()
 
@@ -86,14 +89,8 @@ class LogManager:
     
     def setup_logging(self):
         """Configure logging based on current settings"""
-        log_dir = self.config.get("log_directory")
-        if not log_dir:
-            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-        
-        os.makedirs(log_dir, exist_ok=True)
-        
-        # Set the log file path
-        self.LOG_FILE = os.path.join(log_dir, "error_log.txt")
+        # Update the log file path
+        self.update_log_path()
         
         # Configure the root logger for console output
         root_logger = logging.getLogger()
@@ -110,6 +107,16 @@ class LogManager:
         root_logger.addHandler(console_handler)
         
         logging.info(f"Logging initialized. Log file: {self.LOG_FILE}")
+
+    def update_log_path(self):
+        """Update log file path based on current config"""
+        log_dir = self.config.get("log_directory")
+        if not log_dir:
+            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        
+        os.makedirs(log_dir, exist_ok=True)
+        self.LOG_FILE = os.path.join(log_dir, "error_log.txt")
+        logging.info(f"Log file path updated to: {self.LOG_FILE}")
     
     def log_error(self, file_name, error_message):
         """Log an error with the standard format"""
@@ -225,6 +232,36 @@ class PeppolConverter:
     def set_log_manager(self, log_manager):
         """Set the log manager instance"""
         self.log_manager = log_manager
+
+    def _move_to_failed_dir(self, xml_file, error_msg):
+        """Move a file to the failed directory and return appropriate response tuple"""
+        filename = os.path.basename(xml_file)
+        
+        # Log the error
+        logging.error(error_msg)
+        if self.log_manager:
+            self.log_manager.log_error(filename, error_msg)
+        
+        # Move to failed directory if configured
+        if os.path.exists(xml_file):
+            failed_dir = self.config.get("failed_directory")
+            if failed_dir:
+                failed_dir = os.path.abspath(failed_dir)
+                os.makedirs(failed_dir, exist_ok=True)
+                
+                try:
+                    failed_path = os.path.join(failed_dir, filename)
+                    shutil.move(xml_file, failed_path)
+                    logging.info(f"Moved failed file to: {failed_path}")
+                except Exception as move_err:
+                    logging.error(f"Failed to move failed file: {str(move_err)}")
+                    try:
+                        shutil.copy2(xml_file, os.path.join(failed_dir, filename))
+                        logging.info(f"Copied failed file to: {failed_dir} (move failed)")
+                    except Exception as copy_err:
+                        logging.error(f"Failed to copy failed file as fallback: {str(copy_err)}")
+        
+        return False, error_msg
     
     def process_file(self, xml_file: str) -> Tuple[bool, str]:
         """Process a single XML file to extract embedded PDF
@@ -255,29 +292,20 @@ class PeppolConverter:
             
             if embedded_doc is None:
                 error_msg = "No embedded document found in XML"
-                # Log the error
-                if self.log_manager:
-                    self.log_manager.log_error(filename, error_msg)
-                return False, error_msg
+                return self._move_to_failed_dir(xml_file, error_msg)
             
             # Get binary data
             base64_data = embedded_doc.text
             if not base64_data:
                 error_msg = "Embedded document contains no data"
-                # Log the error
-                if self.log_manager:
-                    self.log_manager.log_error(filename, error_msg)
-                return False, error_msg
+                return self._move_to_failed_dir(xml_file, error_msg)
             
             # Decode Base64 data
             try:
                 binary_data = base64.b64decode(base64_data)
             except Exception as e:
                 error_msg = f"Failed to decode Base64 data: {str(e)}"
-                # Log the error
-                if self.log_manager:
-                    self.log_manager.log_error(filename, error_msg)
-                return False, error_msg
+                return self._move_to_failed_dir(xml_file, error_msg)
             
             # Determine output PDF filename and path
             output_dir = self.config.get("output_directory")
@@ -294,20 +322,32 @@ class PeppolConverter:
             # Write PDF file
             with open(pdf_path, 'wb') as pdf_file:
                 pdf_file.write(binary_data)
-            
-            # Move the original XML file to the output directory
-            xml_output_path = os.path.join(output_dir, filename)
-            try:
-                shutil.move(xml_file, xml_output_path)
-                logging.info(f"Moved original XML file to: {xml_output_path}")
-            except Exception as move_err:
-                logging.warning(f"Failed to move original XML file: {str(move_err)}")
-                # Try to copy if move fails
+
+            # Mark as successful processing
+            success_flag = True
+
+            # Log success with custom format if enabled
+            if self.log_manager:
+                self.log_manager.log_success(filename)
+
+            # Move the original XML file to the output directory at the very end
+            if os.path.exists(xml_file):
+                xml_output_path = os.path.join(output_dir, filename)
                 try:
-                    shutil.copy2(xml_file, xml_output_path)
-                    logging.info(f"Copied original XML file to: {xml_output_path} (move failed)")
-                except Exception as copy_err:
-                    logging.error(f"Failed to copy original XML file as fallback: {str(copy_err)}")
+                    shutil.move(xml_file, xml_output_path)
+                    logging.info(f"Moved original XML file to: {xml_output_path}")
+                except Exception as move_err:
+                    logging.warning(f"Failed to move original XML file: {str(move_err)}")
+                    # Try to copy if move fails
+                    try:
+                        shutil.copy2(xml_file, xml_output_path)
+                        logging.info(f"Copied original XML file to: {xml_output_path} (move failed)")
+                    except Exception as copy_err:
+                        logging.error(f"Failed to copy original XML file as fallback: {str(copy_err)}")
+            else:
+                logging.warning(f"Original file no longer exists at: {xml_file}")
+
+            return True, pdf_path
             
             # Log success with custom format if enabled
             if self.log_manager:
@@ -325,26 +365,53 @@ class PeppolConverter:
             
             # Move to failed directory if configured
             failed_dir = self.config.get("failed_directory")
+            logging.info(f"Failed directory from config: '{failed_dir}'")
+            logging.info(f"Original file exists before move: {os.path.exists(xml_file)}")
+            logging.info(f"Original file path type: {type(xml_file)}")
+            
             if failed_dir and failed_dir.strip():
                 # Ensure we have an absolute path
                 failed_dir = os.path.abspath(failed_dir)
-                logging.info(f"Using failed directory: {failed_dir}")
+                logging.info(f"Using failed directory absolute path: {failed_dir}")
                 
-                os.makedirs(failed_dir, exist_ok=True)
+                # Check if directory exists
+                if not os.path.exists(failed_dir):
+                    logging.info(f"Creating failed directory: {failed_dir}")
+                    os.makedirs(failed_dir, exist_ok=True)
+                
+                # Double check directory exists
+                logging.info(f"Failed directory exists after creation: {os.path.exists(failed_dir)}")
+                
                 try:
                     failed_path = os.path.join(failed_dir, os.path.basename(xml_file))
-                    # Move file instead of copying it
+                    logging.info(f"Target failed path: {failed_path}")
+                    # Check if target already exists
+                    if os.path.exists(failed_path):
+                        logging.warning(f"Target file already exists, will be overwritten: {failed_path}")
+                        
+                    # Try to move the file
                     logging.info(f"Attempting to move failed file from {xml_file} to {failed_path}")
                     shutil.move(xml_file, failed_path)
-                    logging.info(f"Moved failed file to: {failed_path}")
+                    
+                    # Check if move succeeded
+                    if os.path.exists(failed_path):
+                        logging.info(f"Successfully moved failed file to: {failed_path}")
+                    else:
+                        logging.error(f"Move appeared to succeed but file not found at destination: {failed_path}")
+                        
                 except Exception as move_err:
-                    logging.error(f"Failed to move failed file: {str(move_err)}")
+                    logging.error(f"Failed to move failed file: {str(move_err)}, Error type: {type(move_err).__name__}")
+                    # Get more details about the error
+                    logging.error(f"Move error details: {traceback.format_exc()}")
+                    
                     # Try to copy if move fails
                     try:
+                        logging.info(f"Attempting to copy instead to: {os.path.join(failed_dir, os.path.basename(xml_file))}")
                         shutil.copy2(xml_file, os.path.join(failed_dir, os.path.basename(xml_file)))
                         logging.info(f"Copied failed file to: {failed_dir} (move failed)")
                     except Exception as copy_err:
-                        logging.error(f"Failed to copy failed file as fallback: {str(copy_err)}")
+                        logging.error(f"Failed to copy failed file as fallback: {str(copy_err)}, Error type: {type(copy_err).__name__}")
+                        logging.error(f"Copy error details: {traceback.format_exc()}")
             else:
                 logging.warning(f"Failed directory not configured or empty: '{failed_dir}'")
             
@@ -374,6 +441,10 @@ class PeppolConverter:
         # Process files sequentially
         for i, file in enumerate(files):
             filename = os.path.basename(file)
+            
+            # Verify file is accessible
+            logging.info(f"About to process file: {file}")
+            logging.info(f"File exists: {os.path.exists(file)}")
             
             try:
                 success, message = self.process_file(file)
@@ -408,11 +479,30 @@ class PeppolConverter:
         logging.info(f"Batch processing complete. Processed: {self.stats['processed']}, "
                     f"Success: {self.stats['success']}, Failed: {self.stats['failed']}")
         
-        # If only one file was processed successfully, open the PDF
-        if len(files) == 1 and self.stats["success"] == 1 and self.stats["success_files"]:
-            pdf_path = self.stats["success_files"][0][1]
-            if os.path.exists(pdf_path) and pdf_path.lower().endswith('.pdf'):
-                self.open_pdf_file(pdf_path)
+        # If only one file was processed
+        if len(files) == 1:
+            filename = os.path.basename(files[0])
+            
+            # If processed successfully, open the PDF and show success message
+            if self.stats["success"] == 1 and self.stats["success_files"]:
+                pdf_path = self.stats["success_files"][0][1]
+                if os.path.exists(pdf_path) and pdf_path.lower().endswith('.pdf'):
+                    self.open_pdf_file(pdf_path)
+                    # Show success message
+                    try:
+                        import tkinter.messagebox as messagebox
+                        messagebox.showinfo("Success", f"File '{filename}' processed successfully!\nPDF has been opened.")
+                    except:
+                        logging.info("Could not show success message dialog")
+            
+            # If processing failed, show error message
+            elif self.stats["failed"] == 1 and self.stats["failed_files"]:
+                error_message = self.stats["failed_files"][0][1]
+                try:
+                    import tkinter.messagebox as messagebox
+                    messagebox.showerror("Error", f"Failed to process file '{filename}'.\n\nError: {error_message}")
+                except:
+                    logging.error(f"Could not show error message dialog")
         
         return self.stats
     
@@ -477,7 +567,7 @@ class ConverterGUI:
         drop_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
         # Version label (more subtle in the top-right of the drop zone)
-        version_label = ttk.Label(drop_frame, text="0.0.3v", font=("Arial", 8))
+        version_label = ttk.Label(drop_frame, text="0.0.5v", font=("Arial", 8))
         version_label.pack(side=tk.TOP, anchor=tk.E, padx=5, pady=2)
         
         # This will be our drop zone
@@ -646,6 +736,10 @@ class ConverterGUI:
         
         # Add to our files list
         for file in xml_files:
+            # Validate file path
+            logging.info(f"Adding dropped file: {file}")
+            logging.info(f"File exists: {os.path.exists(file)}")
+            
             if file not in self.drag_files:
                 self.drag_files.append(file)
                 self.files_list.insert(tk.END, os.path.basename(file))
@@ -720,6 +814,10 @@ class ConverterGUI:
                 f"Completed: {stats['success']} succeeded, {stats['failed']} failed"
             ))
             
+            # Show summary dialog for multiple files
+            if len(self.drag_files) > 1:
+                self.root.after(0, lambda: self.show_batch_summary(stats))
+            
             # Clear file list
             self.root.after(0, self.clear_file_list)
             
@@ -739,6 +837,77 @@ class ConverterGUI:
         progress = (current / total) * 100 if total > 0 else 0
         self.root.after(0, lambda: self.progress_var.set(progress))
         self.root.after(0, lambda: self.status_var.set(f"Processing: {current}/{total} files"))
+
+    def show_batch_summary(self, stats):
+        """Show a summary dialog with lists of processed files"""
+        # Create a new top-level window
+        summary_window = tk.Toplevel(self.root)
+        summary_window.title("Processing Summary")
+        summary_window.geometry("600x400")
+        summary_window.grab_set()  # Make it modal
+        
+        # Add header
+        header_frame = ttk.Frame(summary_window)
+        header_frame.pack(fill='x', padx=10, pady=10)
+        
+        ttk.Label(
+            header_frame, 
+            text=f"Processed {stats['processed']} files: {stats['success']} successful, {stats['failed']} failed",
+            font=("Arial", 12, "bold")
+        ).pack(anchor='w')
+        
+        # Create a notebook for success/failed tabs
+        summary_notebook = ttk.Notebook(summary_window)
+        summary_notebook.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Success tab
+        success_frame = ttk.Frame(summary_notebook)
+        summary_notebook.add(success_frame, text=f"Successful ({stats['success']})")
+        
+        if stats['success'] > 0:
+            # Create a scrollable list
+            success_list = tk.Listbox(success_frame)
+            success_scrollbar = ttk.Scrollbar(success_frame, orient="vertical", command=success_list.yview)
+            success_list.configure(yscrollcommand=success_scrollbar.set)
+            
+            success_list.pack(side=tk.LEFT, fill='both', expand=True)
+            success_scrollbar.pack(side=tk.RIGHT, fill='y')
+            
+            # Add success files to list
+            for idx, (filename, path) in enumerate(stats['success_files'], 1):
+                success_list.insert(tk.END, f"{idx}. {filename}")
+        else:
+            ttk.Label(success_frame, text="No files were processed successfully.").pack(padx=20, pady=20)
+        
+        # Failed tab
+        failed_frame = ttk.Frame(summary_notebook)
+        summary_notebook.add(failed_frame, text=f"Failed ({stats['failed']})")
+        
+        if stats['failed'] > 0:
+            # Create a scrollable text widget for failed files with error messages
+            failed_text = ScrolledText(failed_frame, wrap=tk.WORD)
+            failed_text.pack(fill='both', expand=True)
+            
+            # Add failed files with error messages
+            for idx, (filename, error) in enumerate(stats['failed_files'], 1):
+                failed_text.insert(tk.END, f"{idx}. {filename}\n")
+                failed_text.insert(tk.END, f"   Error: {error}\n\n")
+            
+            # Disable editing
+            failed_text.config(state=tk.DISABLED)
+        else:
+            ttk.Label(failed_frame, text="No files failed processing.").pack(padx=20, pady=20)
+        
+        # Close button
+        ttk.Button(
+            summary_window, 
+            text="Close", 
+            command=summary_window.destroy
+        ).pack(pady=10)
+        
+        # Default to the tab with content
+        if stats['failed'] > 0:
+            summary_notebook.select(1)  # Select failed tab if there are failures
     
     def clear_file_list(self):
         """Clear the file list after processing"""
@@ -768,6 +937,7 @@ class ConverterGUI:
             self.config_manager.set("output_directory", self.output_dir_var.get())
             self.config_manager.set("failed_directory", self.failed_dir_var.get())
             self.config_manager.set("log_directory", self.log_dir_var.get())
+            logging.info(f"Saving directories: Input='{self.input_dir_var.get()}', Output='{self.output_dir_var.get()}', Failed='{self.failed_dir_var.get()}', Log='{self.log_dir_var.get()}'")
             
             # Parse numeric values
             try:
