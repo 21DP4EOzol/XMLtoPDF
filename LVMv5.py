@@ -17,6 +17,17 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import queue
 import traceback
+import time
+import socket
+import getpass
+
+# Import fcntl for Unix systems
+if sys.platform != 'win32':
+    try:
+        import fcntl
+    except ImportError:
+        # fcntl not available on Windows
+        pass
 
 # Register XML namespaces
 NAMESPACES = {
@@ -85,7 +96,28 @@ class LogManager:
         self.MAX_LOG_RECORDS = self.config.get("log_max_lines", 10000)  # Default max number of records in log file
         self.LOG_SUCCESS = self.config.get("log_successful_files", False)  # Whether to log successful conversions
         self.log_record_count = 0  # Current record count in log file
+        
+        # Get user and PC information
+        self.username = self._get_username()
+        self.pc_name = self._get_pc_name()
+        
         self.setup_logging()
+    
+    def _get_username(self):
+        """Get current username"""
+        try:
+            import getpass
+            return getpass.getuser()
+        except:
+            return "Nezināms"  # Unknown
+    
+    def _get_pc_name(self):
+        """Get computer name"""
+        try:
+            import socket
+            return socket.gethostname()
+        except:
+            return "Nezināms"  # Unknown
     
     def setup_logging(self):
         """Configure logging based on current settings"""
@@ -107,6 +139,7 @@ class LogManager:
         root_logger.addHandler(console_handler)
         
         logging.info(f"Logging initialized. Log file: {self.LOG_FILE}")
+        logging.info(f"User: {self.username}, PC: {self.pc_name}")
 
     def update_log_path(self):
         """Update log file path based on current config"""
@@ -145,6 +178,8 @@ class LogManager:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_entry = (
             f"Ielādes datums: {timestamp}\n"
+            f"Lietotājs: {self.username}\n"
+            f"Dators: {self.pc_name}\n"
             f"Statuss: KĻŪDA\n"
             f"Faila nosaukums: {file_name}\n"
             f"KĻŪDAS APRAKSTS/PIEZĪMES: {error_message}\n"
@@ -191,6 +226,8 @@ class LogManager:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_entry = (
             f"Ielādes datums: {timestamp}\n"
+            f"Lietotājs: {self.username}\n"
+            f"Dators: {self.pc_name}\n"
             f"Statuss: VEIKSMĪGI\n"
             f"Faila nosaukums: {file_name}\n"
             f"KĻŪDAS APRAKSTS/PIEZĪMES: -\n"
@@ -214,6 +251,92 @@ class LogManager:
         self.MAX_LOG_SIZE = log_max_size_mb
         self.MAX_LOG_RECORDS = log_max_lines
         self.LOG_SUCCESS = log_successful_files
+
+class DirectoryLockManager:
+    """Manages directory locking to prevent multiple users from using the same directory"""
+    
+    def __init__(self):
+        self.locks = {}  # Keep track of lock files we've created
+    
+    # In the DirectoryLockManager class, change try_lock_directory method:
+
+    def try_lock_directory(self, directory):
+        """
+        Track directory usage without preventing access
+        
+        Args:
+            directory: Path to the directory to track
+            
+        Returns:
+            Tuple of (success, message)
+        """
+        if not directory or not os.path.exists(directory):
+            return True, ""  # Directory doesn't exist
+            
+        lock_file_path = os.path.join(directory, ".dirtracker")
+        
+        # Check if tracker file exists and read it
+        current_users = []
+        if os.path.exists(lock_file_path):
+            try:
+                with open(lock_file_path, 'r') as f:
+                    for line in f:
+                        parts = line.strip().split(',')
+                        if len(parts) >= 3:
+                            user, pc, timestamp = parts[0], parts[1], float(parts[2])
+                            # Only include active users (within the last hour)
+                            if time.time() - timestamp < 3600:  # 1 hour in seconds
+                                current_users.append((user, pc))
+            except Exception as e:
+                logging.warning(f"Error reading tracker file: {str(e)}")
+        
+        # Add current user information
+        try:
+            user = getpass.getuser()
+            pc = socket.gethostname()
+            timestamp = time.time()
+            
+            # Create a new entry for this user
+            new_entry = f"{user},{pc},{timestamp}\n"
+            
+            # Write to tracker file, appending our info
+            with open(lock_file_path, 'a') as f:
+                f.write(new_entry)
+            
+            # Keep track of this tracker file
+            self.locks[directory] = lock_file_path
+            
+            if current_users:
+                user_info = ", ".join([f"{u} ({p})" for u, p in current_users])
+                return True, f"Direktoriju '{directory}' pašlaik izmanto arī: {user_info}"
+            
+            return True, ""
+                
+        except Exception as e:
+            logging.error(f"Error updating tracker file: {str(e)}")
+            return True, f"Neizdevās atjaunināt lietotāju informāciju direktorijam '{directory}': {str(e)}"
+    
+    def release_directory_lock(self, directory):
+        """
+        Release a previously acquired directory lock
+        
+        Args:
+            directory: Path to the directory to unlock
+        """
+        if directory in self.locks and os.path.exists(self.locks[directory]):
+            try:
+                os.remove(self.locks[directory])
+                del self.locks[directory]
+                return True
+            except Exception as e:
+                logging.error(f"Error releasing lock: {str(e)}")
+                return False
+        return True  # Nothing to release
+    
+    def release_all_locks(self):
+        """Release all directory locks on application exit"""
+        for directory in list(self.locks.keys()):
+            self.release_directory_lock(directory)
 
 
 class PeppolConverter:
@@ -291,20 +414,20 @@ class PeppolConverter:
                     break
             
             if embedded_doc is None:
-                error_msg = "No embedded document found in XML"
+                error_msg = "Dokumentā nav atrasts iegultais PDF fails"  
                 return self._move_to_failed_dir(xml_file, error_msg)
             
             # Get binary data
             base64_data = embedded_doc.text
             if not base64_data:
-                error_msg = "Embedded document contains no data"
+                error_msg = "Iegultajā dokumentā nav datu"  
                 return self._move_to_failed_dir(xml_file, error_msg)
             
             # Decode Base64 data
             try:
                 binary_data = base64.b64decode(base64_data)
             except Exception as e:
-                error_msg = f"Failed to decode Base64 data: {str(e)}"
+                error_msg = f"Neizdevās dekodēt Base64 datus: {str(e)}"  # Failed to decode Base64 data
                 return self._move_to_failed_dir(xml_file, error_msg)
             
             # Determine output PDF filename and path
@@ -528,7 +651,7 @@ class ConverterGUI:
     
     def __init__(self, root):
         self.root = root
-        self.root.title("XML to PDF Converter")
+        self.root.title("XML uz PDF Konvertētājs")
         self.root.geometry("800x600")
         
         # Initialize configuration and logging
@@ -536,6 +659,9 @@ class ConverterGUI:
         self.log_manager = LogManager(self.config_manager)
         self.converter = PeppolConverter(self.config_manager)
         self.converter.set_log_manager(self.log_manager)
+        
+        # Initialize directory lock manager
+        self.lock_manager = DirectoryLockManager()
         
         # Setup drag and drop variables
         self.drag_files = []
@@ -556,30 +682,36 @@ class ConverterGUI:
         
         # Periodically check log rotation
         self.check_log_rotation()
+        
+        # Check directory locks for currently configured directories
+        self.check_directory_locks()
+        
+        # Setup application exit handler
+        self.root.protocol("WM_DELETE_WINDOW", self.on_exit)
     
     def create_converter_tab(self):
         """Create the main converter tab"""
         converter_frame = ttk.Frame(self.notebook)
-        self.notebook.add(converter_frame, text="Converter")
+        self.notebook.add(converter_frame, text="Konvertētājs")  # Converter
         
         # Create drop zone frame
-        drop_frame = ttk.LabelFrame(converter_frame, text="Drag and Drop Files Here")
+        drop_frame = ttk.LabelFrame(converter_frame, text="Ievelciet failus šeit")  # Drag and Drop Files Here
         drop_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
         # Version label (more subtle in the top-right of the drop zone)
-        version_label = ttk.Label(drop_frame, text="0.0.5v", font=("Arial", 8))
+        version_label = ttk.Label(drop_frame, text="0.0.6v", font=("Arial", 8))
         version_label.pack(side=tk.TOP, anchor=tk.E, padx=5, pady=2)
         
         # This will be our drop zone
-        self.drop_zone = ttk.Label(drop_frame, text="Drop XML files here or select files using the button below")
+        self.drop_zone = ttk.Label(drop_frame, text="Ievelciet XML failus šeit vai izvēlieties failus izmantojot pogu zemāk")  # Drop XML files here or select files using the button below
         self.drop_zone.pack(fill='both', expand=True, padx=20, pady=20)
         
         # File selection button
-        select_btn = ttk.Button(drop_frame, text="Select Files", command=self.select_files)
+        select_btn = ttk.Button(drop_frame, text="Izvēlēties Failus", command=self.select_files)  # Select Files
         select_btn.pack(pady=10)
         
         # Process button
-        self.process_btn = ttk.Button(drop_frame, text="Process Files", command=self.process_files, state=tk.DISABLED)
+        self.process_btn = ttk.Button(drop_frame, text="Apstrādāt Failus", command=self.process_files, state=tk.DISABLED)  # Process Files
         self.process_btn.pack(pady=10)
         
         # Progress frame
@@ -592,12 +724,12 @@ class ConverterGUI:
         self.progress_bar.pack(fill='x', padx=10, pady=5)
         
         # Status label
-        self.status_var = tk.StringVar(value="Ready")
+        self.status_var = tk.StringVar(value="Gatavs")  # Ready
         status_label = ttk.Label(progress_frame, textvariable=self.status_var)
         status_label.pack(padx=10, pady=5)
         
         # Files list
-        files_frame = ttk.LabelFrame(converter_frame, text="Selected Files")
+        files_frame = ttk.LabelFrame(converter_frame, text="Izvēlētie Faili")  # Selected Files
         files_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
         # Scrollable file list
@@ -611,10 +743,10 @@ class ConverterGUI:
     def create_config_tab(self):
         """Create the configuration tab"""
         config_frame = ttk.Frame(self.notebook)
-        self.notebook.add(config_frame, text="Configuration")
+        self.notebook.add(config_frame, text="Konfigurācija")  # Configuration
         
         # Directory selection frame
-        dir_frame = ttk.LabelFrame(config_frame, text="Directory Configuration")
+        dir_frame = ttk.LabelFrame(config_frame, text="Direktoriju Konfigurācija")  # Directory Configuration
         dir_frame.pack(fill='x', padx=10, pady=10)
         
         # Input directory
@@ -644,31 +776,31 @@ class ConverterGUI:
         dir_frame.columnconfigure(1, weight=1)
         
         # Log settings frame
-        log_frame = ttk.LabelFrame(config_frame, text="Log Settings")
+        log_frame = ttk.LabelFrame(config_frame, text="Žurnāla Iestatījumi")  # Log Settings
         log_frame.pack(fill='x', padx=10, pady=10)
         
         # Log max size
-        ttk.Label(log_frame, text="Max Log Size (MB):").grid(row=0, column=0, sticky='w', padx=5, pady=5)
+        ttk.Label(log_frame, text="Maks. Žurnāla Izmērs (MB):").grid(row=0, column=0, sticky='w', padx=5, pady=5)  # Max Log Size (MB)
         self.log_size_var = tk.StringVar(value=str(self.config_manager.get("log_max_size_mb", 10)))
         ttk.Entry(log_frame, textvariable=self.log_size_var, width=10).grid(row=0, column=1, sticky='w', padx=5, pady=5)
         
         # Log max lines
-        ttk.Label(log_frame, text="Max Log Lines:").grid(row=1, column=0, sticky='w', padx=5, pady=5)
+        ttk.Label(log_frame, text="Maks. Žurnāla Rindu Skaits:").grid(row=1, column=0, sticky='w', padx=5, pady=5)  # Max Log Lines
         self.log_lines_var = tk.StringVar(value=str(self.config_manager.get("log_max_lines", 10000)))
         ttk.Entry(log_frame, textvariable=self.log_lines_var, width=10).grid(row=1, column=1, sticky='w', padx=5, pady=5)
         
         # Log successful files
         self.log_success_var = tk.BooleanVar(value=self.config_manager.get("log_successful_files", False))
-        ttk.Checkbutton(log_frame, text="Record Successful Conversions in Log", variable=self.log_success_var).grid(row=2, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+        ttk.Checkbutton(log_frame, text="Reģistrēt Veiksmīgās Konversijas Žurnālā", variable=self.log_success_var).grid(row=2, column=0, columnspan=2, sticky='w', padx=5, pady=5)  # Record Successful Conversions in Log
         
         # Save button
-        save_btn = ttk.Button(config_frame, text="Save Configuration", command=self.save_configuration)
+        save_btn = ttk.Button(config_frame, text="Saglabāt Konfigurāciju", command=self.save_configuration)  # Save Configuration
         save_btn.pack(pady=10)
     
     def create_log_tab(self):
         """Create the log viewer tab"""
         log_frame = ttk.Frame(self.notebook)
-        self.notebook.add(log_frame, text="Logs")
+        self.notebook.add(log_frame, text="Žurnāli")  # Logs
         
         # Create log viewer
         self.log_viewer = ScrolledText(log_frame, wrap=tk.WORD)
@@ -679,15 +811,15 @@ class ConverterGUI:
         btn_frame.pack(fill='x', padx=10, pady=10)
         
         # Refresh button
-        refresh_btn = ttk.Button(btn_frame, text="Refresh Logs", command=self.refresh_logs)
+        refresh_btn = ttk.Button(btn_frame, text="Atjaunot Žurnālus", command=self.refresh_logs)  # Refresh Logs
         refresh_btn.pack(side=tk.LEFT, padx=5)
         
         # Clear button
-        clear_btn = ttk.Button(btn_frame, text="Clear Viewer", command=self.clear_log_viewer)
+        clear_btn = ttk.Button(btn_frame, text="Attīrīt Skatītāju", command=self.clear_log_viewer)  # Clear Viewer
         clear_btn.pack(side=tk.LEFT, padx=5)
         
         # Open log directory button
-        open_log_dir_btn = ttk.Button(btn_frame, text="Open Log Directory", command=self.open_log_directory)
+        open_log_dir_btn = ttk.Button(btn_frame, text="Atvērt Žurnālu Direktoriju", command=self.open_log_directory)  # Open Log Directory
         open_log_dir_btn.pack(side=tk.LEFT, padx=5)
     
     def setup_drag_drop(self):
@@ -697,15 +829,15 @@ class ConverterGUI:
             # Bind the whole window for drag and drop
             self.root.drop_target_register(self.root.dnd_files)
             self.root.dnd_bind('<<Drop>>', self.handle_drop)
-            self.drop_zone.configure(text="Drop XML files here or select files using the button below")
+            self.drop_zone.configure(text="Ievelciet XML failus šeit vai izvēlieties failus izmantojot pogu zemāk")
         else:
-            self.drop_zone.configure(text="Drag and drop not available. Please use 'Select Files' button.")
+            self.drop_zone.configure(text="Vilkšana un nomešana nav pieejama. Lūdzu, izmantojiet 'Izvēlēties Failus' pogu.")
             logging.warning("TkinterDnD not available, drag and drop will not work")
     
     def handle_drop(self, event):
         """Handle file drop event"""
         if self.currently_processing:
-            self.status_var.set("Cannot add files while processing")
+            self.status_var.set("Nevar pievienot failus apstrādes laikā")  # Cannot add files while processing
             return
         
         # Get the dropped files
@@ -731,7 +863,7 @@ class ConverterGUI:
         xml_files = [f for f in file_list if f.lower().endswith('.xml')]
         
         if not xml_files:
-            self.status_var.set("No XML files were dropped")
+            self.status_var.set("Nav nomesti XML faili")  # No XML files were dropped
             return
         
         # Add to our files list
@@ -745,7 +877,7 @@ class ConverterGUI:
                 self.files_list.insert(tk.END, os.path.basename(file))
         
         # Update status
-        self.status_var.set(f"{len(self.drag_files)} files selected")
+        self.status_var.set(f"{len(self.drag_files)} faili izvēlēti")  # files selected
         
         # Enable process button if we have files
         if self.drag_files:
@@ -763,9 +895,9 @@ class ConverterGUI:
         
         # Open file dialog
         files = filedialog.askopenfilenames(
-            title="Select XML Files",
+            title="Izvēlieties XML Failus",  # Select XML Files
             initialdir=initial_dir,
-            filetypes=[("XML files", "*.xml"), ("All files", "*.*")]
+            filetypes=[("XML faili", "*.xml"), ("Visi faili", "*.*")]  # XML files, All files
         )
         
         if not files:
@@ -778,7 +910,7 @@ class ConverterGUI:
                 self.files_list.insert(tk.END, os.path.basename(file))
         
         # Update status
-        self.status_var.set(f"{len(self.drag_files)} files selected")
+        self.status_var.set(f"{len(self.drag_files)} faili izvēlēti")  # files selected
         
         # Enable process button if we have files
         if self.drag_files:
@@ -793,7 +925,7 @@ class ConverterGUI:
         self.currently_processing = True
         self.process_btn.config(state=tk.DISABLED)
         self.progress_var.set(0)
-        self.status_var.set("Processing files...")
+        self.status_var.set("Apstrādā failus...")  # Processing files...
         
         # Start processing thread
         self.processing_thread = threading.Thread(target=self.run_processing)
@@ -811,7 +943,7 @@ class ConverterGUI:
             
             # Update UI with results
             self.root.after(0, lambda: self.status_var.set(
-                f"Completed: {stats['success']} succeeded, {stats['failed']} failed"
+                f"Pabeigts: {stats['success']} veiksmīgi, {stats['failed']} neveiksmīgi"  # Completed: succeeded, failed
             ))
             
             # Show summary dialog for multiple files
@@ -826,7 +958,7 @@ class ConverterGUI:
             
         except Exception as e:
             logging.error(f"Processing error: {str(e)}")
-            self.root.after(0, lambda: self.status_var.set(f"Error: {str(e)}"))
+            self.root.after(0, lambda: self.status_var.set(f"Kļūda: {str(e)}"))  # Error
         
         finally:
             # Re-enable UI
@@ -836,13 +968,13 @@ class ConverterGUI:
         """Update progress bar from the processing thread"""
         progress = (current / total) * 100 if total > 0 else 0
         self.root.after(0, lambda: self.progress_var.set(progress))
-        self.root.after(0, lambda: self.status_var.set(f"Processing: {current}/{total} files"))
+        self.root.after(0, lambda: self.status_var.set(f"Apstrādā: {current}/{total} failus"))  # Processing: files
 
     def show_batch_summary(self, stats):
         """Show a summary dialog with lists of processed files"""
         # Create a new top-level window
         summary_window = tk.Toplevel(self.root)
-        summary_window.title("Processing Summary")
+        summary_window.title("Apstrādes Kopsavilkums")  # Processing Summary
         summary_window.geometry("600x400")
         summary_window.grab_set()  # Make it modal
         
@@ -852,7 +984,7 @@ class ConverterGUI:
         
         ttk.Label(
             header_frame, 
-            text=f"Processed {stats['processed']} files: {stats['success']} successful, {stats['failed']} failed",
+            text=f"Apstrādāti {stats['processed']} faili: {stats['success']} veiksmīgi, {stats['failed']} neveiksmīgi",  # Processed files: successful, failed
             font=("Arial", 12, "bold")
         ).pack(anchor='w')
         
@@ -862,7 +994,7 @@ class ConverterGUI:
         
         # Success tab
         success_frame = ttk.Frame(summary_notebook)
-        summary_notebook.add(success_frame, text=f"Successful ({stats['success']})")
+        summary_notebook.add(success_frame, text=f"Veiksmīgi ({stats['success']})")  # Successful
         
         if stats['success'] > 0:
             # Create a scrollable list
@@ -877,11 +1009,11 @@ class ConverterGUI:
             for idx, (filename, path) in enumerate(stats['success_files'], 1):
                 success_list.insert(tk.END, f"{idx}. {filename}")
         else:
-            ttk.Label(success_frame, text="No files were processed successfully.").pack(padx=20, pady=20)
+            ttk.Label(success_frame, text="Neviens fails netika apstrādāts veiksmīgi.").pack(padx=20, pady=20)  # No files were processed successfully
         
         # Failed tab
         failed_frame = ttk.Frame(summary_notebook)
-        summary_notebook.add(failed_frame, text=f"Failed ({stats['failed']})")
+        summary_notebook.add(failed_frame, text=f"Neveiksmīgi ({stats['failed']})")  # Failed
         
         if stats['failed'] > 0:
             # Create a scrollable text widget for failed files with error messages
@@ -891,17 +1023,17 @@ class ConverterGUI:
             # Add failed files with error messages
             for idx, (filename, error) in enumerate(stats['failed_files'], 1):
                 failed_text.insert(tk.END, f"{idx}. {filename}\n")
-                failed_text.insert(tk.END, f"   Error: {error}\n\n")
+                failed_text.insert(tk.END, f"   Kļūda: {error}\n\n")  # Error
             
             # Disable editing
             failed_text.config(state=tk.DISABLED)
         else:
-            ttk.Label(failed_frame, text="No files failed processing.").pack(padx=20, pady=20)
+            ttk.Label(failed_frame, text="Neviens fails neizgāja apstrādi.").pack(padx=20, pady=20)  # No files failed processing
         
         # Close button
         ttk.Button(
             summary_window, 
-            text="Close", 
+            text="Aizvērt",  # Close
             command=summary_window.destroy
         ).pack(pady=10)
         
@@ -922,7 +1054,7 @@ class ConverterGUI:
             initial_dir = os.path.expanduser("~")
             
         directory = filedialog.askdirectory(
-            title=f"Select {config_key.replace('_', ' ').title()}",
+            title=f"Izvēlieties {config_key.replace('_', ' ').title()}",  # Select directory
             initialdir=initial_dir
         )
         
@@ -932,12 +1064,78 @@ class ConverterGUI:
     def save_configuration(self):
         """Save the current configuration settings"""
         try:
+            # Get current directory values
+            old_input_dir = self.config_manager.get("input_directory")
+            old_output_dir = self.config_manager.get("output_directory")
+            old_failed_dir = self.config_manager.get("failed_directory")
+            old_log_dir = self.config_manager.get("log_directory")
+            
+            # Get new directory values
+            new_input_dir = self.input_dir_var.get()
+            new_output_dir = self.output_dir_var.get()
+            new_failed_dir = self.failed_dir_var.get()
+            new_log_dir = self.log_dir_var.get()
+            
+            # Check if directories are changing
+            if new_input_dir != old_input_dir:
+                # Release old lock
+                if old_input_dir:
+                    self.lock_manager.release_directory_lock(old_input_dir)
+                # Try to lock new directory
+                if new_input_dir:
+                    success, msg = self.lock_manager.try_lock_directory(new_input_dir)
+                    if not success:
+                        messagebox.showwarning("Direktorijs Aizņemts", 
+                                            f"Ievades direktorijs: {msg}\n"
+                                            "Ievades direktorijs netiks mainīts.")
+                        self.input_dir_var.set(old_input_dir)  # Revert to old value
+                        return
+            
+            # Similar checks for output and failed directories
+            if new_output_dir != old_output_dir:
+                if old_output_dir and old_output_dir != old_input_dir:
+                    self.lock_manager.release_directory_lock(old_output_dir)
+                if new_output_dir and new_output_dir != new_input_dir:
+                    success, msg = self.lock_manager.try_lock_directory(new_output_dir)
+                    if not success:
+                        messagebox.showwarning("Direktorijs Aizņemts", 
+                                            f"Izvades direktorijs: {msg}\n"
+                                            "Izvades direktorijs netiks mainīts.")
+                        self.output_dir_var.set(old_output_dir)
+                        return
+            
+            if new_failed_dir != old_failed_dir:
+                if old_failed_dir and old_failed_dir != old_input_dir and old_failed_dir != old_output_dir:
+                    self.lock_manager.release_directory_lock(old_failed_dir)
+                if new_failed_dir and new_failed_dir != new_input_dir and new_failed_dir != new_output_dir:
+                    success, msg = self.lock_manager.try_lock_directory(new_failed_dir)
+                    if not success:
+                        messagebox.showwarning("Direktorijs Aizņemts", 
+                                            f"Kļūdu direktorijs: {msg}\n"
+                                            "Kļūdu direktorijs netiks mainīts.")
+                        self.failed_dir_var.set(old_failed_dir)
+                        return
+            
+            # Check log directory
+            if new_log_dir != old_log_dir:
+                if old_log_dir and old_log_dir != old_input_dir and old_log_dir != old_output_dir and old_log_dir != old_failed_dir:
+                    self.lock_manager.release_directory_lock(old_log_dir)
+                if new_log_dir and new_log_dir != new_input_dir and new_log_dir != new_output_dir and new_log_dir != new_failed_dir:
+                    success, msg = self.lock_manager.try_lock_directory(new_log_dir)
+                    if not success:
+                        messagebox.showwarning("Direktorijs Aizņemts", 
+                                            f"Žurnālu direktorijs: {msg}\n"
+                                            "Žurnālu direktorijs netiks mainīts.")
+                        self.log_dir_var.set(old_log_dir)
+                        return
+            
+            # Now continue with the original save_configuration logic
             # Update config from UI values
-            self.config_manager.set("input_directory", self.input_dir_var.get())
-            self.config_manager.set("output_directory", self.output_dir_var.get())
-            self.config_manager.set("failed_directory", self.failed_dir_var.get())
-            self.config_manager.set("log_directory", self.log_dir_var.get())
-            logging.info(f"Saving directories: Input='{self.input_dir_var.get()}', Output='{self.output_dir_var.get()}', Failed='{self.failed_dir_var.get()}', Log='{self.log_dir_var.get()}'")
+            self.config_manager.set("input_directory", new_input_dir)
+            self.config_manager.set("output_directory", new_output_dir)
+            self.config_manager.set("failed_directory", new_failed_dir)
+            self.config_manager.set("log_directory", new_log_dir)
+            logging.info(f"Saving directories: Input='{new_input_dir}', Output='{new_output_dir}', Failed='{new_failed_dir}', Log='{new_log_dir}'")
             
             # Parse numeric values
             try:
@@ -953,7 +1151,7 @@ class ConverterGUI:
                     self.log_manager.MAX_LOG_RECORDS = log_max_lines
                 
             except ValueError:
-                messagebox.showwarning("Invalid Value", "Numeric values must be integers")
+                messagebox.showwarning("Nederīga Vērtība", "Skaitliskajām vērtībām jābūt veseliem skaitļiem")  # Invalid Value
                 return
             
             # Save log successful files setting
@@ -966,26 +1164,25 @@ class ConverterGUI:
             
             # Save config
             if self.config_manager.save_config():
-                messagebox.showinfo("Success", "Configuration saved successfully")
+                messagebox.showinfo("Veiksmīgi", "Konfigurācija saglabāta veiksmīgi")  # Success
                 
                 # Update log manager settings
                 if hasattr(self, 'log_manager') and self.log_manager:
-                    log_dir = self.log_dir_var.get()
-                    if log_dir and not self.log_manager.LOG_FILE:
+                    if new_log_dir and not self.log_manager.LOG_FILE:
                         # Create a new log file in the configured directory
-                        os.makedirs(log_dir, exist_ok=True)
-                        self.log_manager.LOG_FILE = os.path.join(log_dir, "error_log.txt")
+                        os.makedirs(new_log_dir, exist_ok=True)
+                        self.log_manager.LOG_FILE = os.path.join(new_log_dir, "error_log.txt")
             else:
-                messagebox.showerror("Error", "Failed to save configuration")
+                messagebox.showerror("Kļūda", "Neizdevās saglabāt konfigurāciju")  # Error
                 
         except Exception as e:
-            messagebox.showerror("Error", f"Error saving configuration: {str(e)}")
-    
+            messagebox.showerror("Kļūda", f"Kļūda saglabājot konfigurāciju: {str(e)}")  # Error saving configuration
+        
     def refresh_logs(self):
         """Refresh the log viewer with the latest log content"""
         if not self.log_manager.LOG_FILE or not os.path.exists(self.log_manager.LOG_FILE):
             self.log_viewer.delete(1.0, tk.END)
-            self.log_viewer.insert(tk.END, "No log file available")
+            self.log_viewer.insert(tk.END, "Nav pieejams žurnāla fails")  # No log file available
             return
             
         try:
@@ -1001,7 +1198,7 @@ class ConverterGUI:
             self.log_viewer.see(tk.END)
             
         except Exception as e:
-            self.log_viewer.insert(tk.END, f"Error reading log file: {str(e)}")
+            self.log_viewer.insert(tk.END, f"Kļūda lasot žurnāla failu: {str(e)}")  # Error reading log file
     
     def clear_log_viewer(self):
         """Clear the log viewer"""
@@ -1025,13 +1222,52 @@ class ConverterGUI:
         else:  # Linux
             import subprocess
             subprocess.Popen(['xdg-open', log_dir])
-    
+
     def check_log_rotation(self):
         """Periodically check if log rotation is needed (not really needed with the new logging system)"""
         # Check again after 5 minutes
         self.root.after(300000, self.check_log_rotation)
+    
+    def check_directory_locks(self):
+        """Check if any of the configured directories are locked by another user"""
+        # Check input directory
+        input_dir = self.config_manager.get("input_directory")
+        if input_dir:
+            success, msg = self.lock_manager.try_lock_directory(input_dir)
+            if not success:
+                messagebox.showwarning("Direktorijs Aizņemts", 
+                                    f"Ievades direktorijs: {msg}\n"
+                                    "Ievades direktorijs netiks bloķēts šīs sesijas laikā.")
+        
+        # Check output directory
+        output_dir = self.config_manager.get("output_directory")
+        if output_dir and output_dir != input_dir:  # Skip if it's the same as input
+            success, msg = self.lock_manager.try_lock_directory(output_dir)
+            if not success:
+                messagebox.showwarning("Direktorijs Aizņemts", 
+                                    f"Izvades direktorijs: {msg}\n"
+                                    "Izvades direktorijs netiks bloķēts šīs sesijas laikā.")
+        
+        # Check failed directory
+        failed_dir = self.config_manager.get("failed_directory")
+        if failed_dir and failed_dir != input_dir and failed_dir != output_dir:
+            success, msg = self.lock_manager.try_lock_directory(failed_dir)
+            if not success:
+                messagebox.showwarning("Direktorijs Aizņemts", 
+                                    f"Kļūdu direktorijs: {msg}\n"
+                                    "Kļūdu direktorijs netiks bloķēts šīs sesijas laikā.")
 
+    def on_exit(self):
+        """Clean up and close the application"""
+        # Release all directory locks
+        if hasattr(self, 'lock_manager'):
+            self.lock_manager.release_all_locks()
+        
+        # Close the application
+        self.root.destroy()
+                                    
 
+# After the ConverterGUI class ends:
 def main():
     """Main entry point for the application"""
     try:

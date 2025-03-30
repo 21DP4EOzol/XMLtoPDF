@@ -1,9 +1,0 @@
-{
-    "input_directory": "C:\\Users\\OnsY\\Desktop",
-    "output_directory": "C:\\Users\\OnsY\\Desktop\\Parstradatie faili",
-    "failed_directory": "C:\\Users\\OnsY\\Desktop\\Kludaini faili",
-    "log_directory": "C:\\Users\\OnsY\\Desktop\\logs",
-    "log_max_size_mb": 10.0,
-    "log_max_lines": 10000,
-    "log_successful_files": true
-}
